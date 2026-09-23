@@ -1,0 +1,114 @@
+rp2040hilbert - note hardware e funzionamento
+================================================
+
+PIN UTILIZZATI (Raspberry Pi Pico, RP2040)
+-------------------------------------------
+GPIO28 (ADC2)   Ingresso microfono analogico (bias esterno a meta' alimentazione, accoppiato in AC)
+GPIO9           Uscita fase 0 gradi   (PWM, da filtrare con RC esterno)
+GPIO8           Uscita fase 90 gradi  (PWM, da filtrare con RC esterno)
+GPIO7           Uscita fase 180 gradi (PWM, da filtrare con RC esterno)
+GPIO6           Uscita fase 270 gradi (PWM, da filtrare con RC esterno)
+GPIO10          Ingresso tasto CW (a massa quando premuto, pull-up interno attivo)
+GPIO16          LED di stato RGB (WS2812/NeoPixel, singolo filo dati, pilotato via PIO)
+GPIO0           I2C0 SDA (bus di comando esterno)
+GPIO1           I2C0 SCL (bus di comando esterno)
+
+PARAMETRI I2C
+-------------
+Istanza:            i2c0
+Indirizzo slave:     0x42 (7 bit)
+Baudrate:            100 kHz (standard mode)
+Pin:                 GPIO0 = SDA, GPIO1 = SCL (pull-up interni attivi)
+
+Mappa registri (stile "registro classico": il primo byte scritto seleziona
+il registro, i successivi leggono/scrivono con auto-incremento):
+  0x00  Modo:      0=AM, 1=USB, 2=LSB, 3=CW
+  0x01  Sorgente:  0=MICROFONO, 1=TONO DI TEST, 2=DOPPIO TONO
+
+Esempio: scrivere [0x00, 0x01] sull'indirizzo 0x42 seleziona il modo USB.
+
+Gli stessi parametri sono comandabili anche via USB seriale (comandi a
+carattere singolo: m/t/2 per la sorgente, a/u/l/c per il modo, d per il
+monitor di debug, r per la cattura I/Q, h per il menu).
+
+Registri aggiuntivi (validi solo in modo AM, ignorati/scartati negli altri modi):
+  0x02  Portante (carrier level):        0-100 (%)
+  0x03  Profondita' di modulazione:      0-100 (%)
+Equivalenti da seriale: p/P (portante -10%/+10%), i/I (profondita' -10%/+10%).
+Default: portante=0% (DSB pura), profondita'=100% (piena ampiezza audio),
+cioe' comportamento equivalente all'AM originale finche' non modificati.
+
+DESCRIZIONE DEL FUNZIONAMENTO
+------------------------------
+Il firmware campiona un segnale audio (microfono, oppure un tono di test
+interno) e genera in uscita 4 segnali PWM sfasati di 0/90/180/270 gradi,
+pensati per pilotare un modulatore/mixer RF esterno con il metodo del
+phasing (generazione/ricezione SSB in banda audio).
+
+Architettura a due core:
+  - Core 1: loop in tempo reale (32 kHz) dedicato esclusivamente a
+    campionamento ADC, filtro di Hilbert FIR (383 tap, coefficienti nulli
+    scartati per dimezzare il carico di calcolo) e scrittura delle 4 uscite
+    PWM. Il canale I (0 gradi) e' il campione ritardato del ritardo di
+    gruppo del filtro; il canale Q (90 gradi) e' l'uscita del filtro di
+    Hilbert. 180/270 sono I/Q invertiti di segno.
+  - Core 0: interfaccia di comando (USB seriale + I2C slave), LED di stato
+    RGB, nessun vincolo di tempo reale.
+
+Modi operativi (combinano I/Q sulle 4 uscite):
+  - USB: uscite normali (0=I, 90=Q, 180=-I, 270=-Q)
+  - LSB: quadratura invertita (0=I, 90=-Q, 180=-I, 270=Q) -> banda laterale
+    opposta nel mixer esterno
+  - AM:  bypassa il filtro di Hilbert, tutte le uscite portano
+    carrier_level% + modulation_depth%*I (nessuno sfasamento) -- vedi
+    registri I2C 0x02/0x03 o comandi seriali p/P, i/I
+  - CW:  silenzio a riposo; a tasto premuto (GPIO10) tutte le uscite
+    portano un tono a 700 Hz con rampa raised-cosine di 5 ms in
+    salita/discesa (evita i click di commutazione)
+
+Sorgenti di ingresso selezionabili:
+  - MICROFONO: ADC su GPIO28, oversampling 2x (due letture mediate per
+    ridurre il rumore di conversione)
+  - TONO DI TEST: sinusoide interna a 1000 Hz (calibrazione con
+    oscilloscopio senza bisogno del microfono)
+  - DOPPIO TONO: somma di 700 Hz + 1800 Hz (two-tone test per verificare
+    la linearita'/IMD della catena SSB)
+
+Parametri principali:
+  - Frequenza di campionamento: 32000 Hz
+  - Overclock: clk_sys a 225 MHz (vreg a 1.30V, VREG_VOLTAGE_MAX). 133 MHz
+    e' il massimo garantito da datasheet; 250 MHz si e' rivelato instabile
+    su questa scheda, 225 MHz e' risultato stabile. Margine CPU ~25%.
+  - Filtro di Hilbert: 383 tap (finestra di Hamming), latenza di gruppo
+    circa 6 ms
+  - Ingresso mic: oversampling ADC 2x (due letture mediate)
+  - PWM: wrap=1023 (10 bit), portante a circa 219,7 kHz (clk_sys/1024),
+    con dithering a error-feedback per recuperare risoluzione percepita
+  - LED di stato: lampeggia ogni 500 ms, colore = modo attivo
+    (giallo=AM, verde=USB, blu=LSB, rosso=CW)
+
+Nota hardware: le 4 uscite PWM vanno filtrate con un semplice RC passa-
+basso esterno per rimuovere la portante e ricostruire l'audio analogico
+su ciascuna fase. Il microfono deve essere polarizzato a meta'
+alimentazione e accoppiato in AC verso GPIO28.
+
+FILTRO RC IN USCITA (su ciascuna delle 4 fasi)
+------------------------------------------------
+Due stadi RC passivi in cascata, stessa costante di tempo per entrambi
+(220ohm x 47nF = 2k2 x 4.7nF = 10,34us):
+  Stadio 1: R=220 ohm, C=47 nF
+  Stadio 2: R=2.2 kohm, C=4.7 nF
+
+Risposta calcolata (funzione di trasferimento del doppio stadio, con
+l'effetto di carico del secondo stadio sul primo incluso):
+  - Banda voce (fino a ~5 kHz): sostanzialmente piatta, < 1 dB di perdita
+    (-0,4 dB a 3 kHz, -1 dB a 5 kHz)
+  - Verso il Nyquist (16 kHz): inizia il roll-off, circa -6,8 dB
+    (irrilevante per SSB voce, da considerare se in futuro si vuole
+    sfruttare tutta la banda fino a 16 kHz)
+  - Portante PWM (~219,7 kHz): reiezione di circa -46 dB (fattore ~200x)
+
+Smorzamento: i due stadi hanno costanti di tempo uguali, il fattore di
+smorzamento risultante e' leggermente sopra 1 (overdamped), quindi nessun
+picco di risonanza, roll-off monotono a circa -40 dB/decade oltre la zona
+di transizione.
